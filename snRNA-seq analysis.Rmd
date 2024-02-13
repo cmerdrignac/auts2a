@@ -1,0 +1,487 @@
+---
+title: 'snRNA-seq analysis'
+author: "Constance Merdrignac"
+output:
+  BiocStyle::html_document:
+    highlight: tango
+    code_folding: hide
+    toc_float: TRUE
+date: 'Compiled: `r format(Sys.Date(), "%B %d, %Y")`'
+---
+
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now, units = "secs")
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	tidy = TRUE,
+	tidy.opts = list(width.cutoff = 95),
+	time_it = TRUE
+)
+```
+
+# General information
+
+The following analysis was performed based on the [publicly available Seurat tutorials](https://satijalab.org/seurat/articles/get_started.html).
+
+The *"./data_mdk/input/"* directory contains :
+
+* Cellbender output folder
+* The list of medaka mitochondrial gene names called "medaka-mito-genenames.csv" obtained following the procedure described in [10X Genomics Support](https://support.10xgenomics.com/single-cell-gene-expression/software/visualization/latest/tutorial-reclustering#header).
+* The supplementary excel file called "aar4362_tables2.xlsx" from [Wagner et al., 2018](https://pubmed.ncbi.nlm.nih.gov/29700229/).
+
+The *"./data_mdk/output/"* will contain output from this analysis.
+
+```{r, include = FALSE}
+options(SeuratData.repo.use = "http://satijalab04.nygenome.org")
+```
+
+```{r packages}
+# Load packages needed for the analysis
+library(biomaRt)
+library(cowplot)
+library(data.table)
+library(dittoSeq)
+library(DoubletFinder)
+library(dplyr)
+library(ggpubr)
+library(ggpattern)
+library(ggplot2)
+library(ggrepel)
+library(gridExtra)
+library(patchwork)
+library(readxl)
+library(reshape2)
+library(Seurat)
+library(SeuratData)
+library(tidyr)
+library(tidyverse)
+library(viridis)
+```
+
+# Setup the Seurat objects and select cells for further analysis
+
+Here, we import datasets processed through cellranger and cellbender, setup seurat objects and select cells that will be used for the analysis. The selection is based on the following parameters :
+
+* Droplets should display at least *500 UMI* (nFeature).
+* Droplets should display at least *1000 molecules* (nCount).
+* Droplets should display less than *5% of reads that map to the mitochondrial genome* (percent.mito)
+* Droplet doublets were removed using [DoubletFinder](https://github.com/chris-mcginnis-ucsf/DoubletFinder), a R package that predicts doublets in single-cell RNA sequencing data.
+    
+```{r variables}
+# Create variables that will be used in the analysis
+stage <- "s18"
+introns <- "incl"
+zbf_mk <- "10hpf"
+nFeature <- 500
+nCount <- 1000
+percent.mito <- 5
+clusters_resolution <- 0.5
+```
+
+## Process MCH+_s18_snRNAseq dataset (called HMC here)
+
+```{r init HMC}
+# Load HMC dataset
+mdk.HMC.data <- Read10X_h5(filename = paste0("./data_mdk/input/", stage, "HMC_", introns, "_introns/output_file_filtered.h5"), use.names = FALSE)
+
+# Initialize HMC Seurat object with the raw data
+mdk.HMC <- CreateSeuratObject(counts = mdk.HMC.data, project = "s18HMC")
+
+# Add genotype information
+mdk.HMC[["genotype"]] <- as.factor(paste0(stage, "HMC"))
+
+# Get medaka mitochondrial genes ID dataset
+mdk.mt.genes <- read.csv("./data_mdk/input/medaka-mito-genenames.csv", header = FALSE)$V1
+mdk.ens <- biomaRt::useEnsembl(biomart = "genes", dataset = "olatipes_gene_ensembl")
+mdk.mt.genes <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                             mart = mdk.ens, 
+                             filters = "external_gene_name",
+                             values = mdk.mt.genes)
+
+# Add percentage of mitochondrial genes per cell
+mdk.HMC[["percent.mt"]] <- PercentageFeatureSet(mdk.HMC, features = mdk.mt.genes$ensembl_gene_id)
+
+# Select cells as described above
+mdk.HMC <- subset(mdk.HMC, subset = nFeature_RNA > nFeature & nCount_RNA > nCount & percent.mt < percent.mito)
+
+# Normalize the data
+mdk.HMC <- NormalizeData(mdk.HMC, normalization.method = "LogNormalize", scale.factor = 1e4)
+
+# Identify highly variable features
+mdk.HMC <- FindVariableFeatures(mdk.HMC, selection.method = 'vst', nfeatures = 2000)
+
+# Scale the data
+mdk.HMC <- ScaleData(mdk.HMC, vars.to.regress = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+
+# Perform linear dimensional reduction
+mdk.HMC <- RunPCA(mdk.HMC, features = VariableFeatures(object = mdk.HMC), npcs = 50)
+
+# Cluster the cells
+mdk.HMC <- FindNeighbors(mdk.HMC, dims = 1:30)
+mdk.HMC <- FindClusters(mdk.HMC, resolution = clusters_resolution)
+
+# Run non-linear dimensional reduction (UMAP/tSNE)
+mdk.HMC <- RunUMAP(mdk.HMC, dims = 1:30)
+
+# DoubletFinder - pK Identification
+sweep.res.seu <- paramSweep_V3(mdk.HMC, PCs = 1:30, sct = FALSE)
+sweep.stats_seu <- summarizeSweep(sweep.res.seu, GT = FALSE)
+bcmvn_seu <- find.pK(sweep.stats_seu)
+annotations <- mdk.HMC@meta.data$seurat_clusters
+
+# DoubletFinder - Homotypic Doublet Proportion Estimate
+homotypic.prop <- modelHomotypic(annotations)
+nExp_poi <- round(0.05*nrow(mdk.HMC@meta.data))  
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+# DoubletFinder - Run DoubletFinder with varying classification stringencies
+mdk.HMC <- doubletFinder_V3(mdk.HMC, PCs = 1:30, pN = 0.25, pK = 0.09, nExp = nExp_poi, reuse.pANN = FALSE, sct = FALSE)
+mdk.HMC$Doublet_classification <- mdk.HMC@meta.data[grep("DF.classifications", colnames(mdk.HMC@meta.data))]
+mdk.HMC@meta.data[grep("DF.classifications", colnames(mdk.HMC@meta.data))] <- NULL
+mdk.HMC$Doublet_annotation <- mdk.HMC@meta.data[grep("pANN_", colnames(mdk.HMC@meta.data))]
+mdk.HMC@meta.data[grep("pANN_", colnames(mdk.HMC@meta.data))] <- NULL
+
+# Display doublet classification
+DimPlot(mdk.HMC, group.by = "Doublet_classification")
+
+# Remove doublets
+mdk.HMC <- subset(mdk.HMC, Doublet_classification == "Singlet")
+
+# Get selected cells list
+cell.use.HMC <- colnames(mdk.HMC)
+
+# Save selected cells list
+write.csv(cell.use.HMC, file = "./data_mdk/output/cell.use.HMC.csv", row.names = FALSE)
+
+# Number of HMC cells selected
+nrow(mdk.HMC@meta.data)
+```
+
+## Process MCH-_s18_snRNAseq dataset (called HPC here)
+
+```{r init HPC}
+# Load HPC dataset
+mdk.HPC.data <- Read10X_h5(filename = paste0("./data_mdk/input/", stage, "HPC_", introns, "_introns/output_file_filtered.h5"), use.names = FALSE)
+
+# Initialize HPC Seurat object with the raw data
+mdk.HPC <- CreateSeuratObject(counts = mdk.HPC.data, project = "s18HPC")
+
+# Add genotype information
+mdk.HPC[["genotype"]] <- as.factor(paste0(stage, "HPC"))
+
+# Calculate the percentage of mitochondrial genes per cell
+mdk.HPC[["percent.mt"]] <- PercentageFeatureSet(mdk.HPC, features = mdk.mt.genes$ensembl_gene_id)
+
+# Select cells as described above
+mdk.HPC <- subset(mdk.HPC, subset = nFeature_RNA > nFeature & nCount_RNA > nCount & percent.mt < percent.mito)
+
+# Normale the data data
+mdk.HPC <- NormalizeData(mdk.HPC, normalization.method = "LogNormalize", scale.factor = 1e4)
+
+# Identify highly variable features
+mdk.HPC <- FindVariableFeatures(mdk.HPC, selection.method = 'vst', nfeatures = 2000)
+
+# Scale the data
+mdk.HPC <- ScaleData(mdk.HPC, vars.to.regress = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+
+# Perform linear dimensional reduction
+mdk.HPC <- RunPCA(mdk.HPC, features = VariableFeatures(object = mdk.HPC), npcs = 50)
+
+# Cluster the cells
+mdk.HPC <- FindNeighbors(mdk.HPC, dims = 1:30)
+mdk.HPC <- FindClusters(mdk.HPC, resolution = clusters_resolution)
+# Run non-linear dimensional reduction (UMAP/tSNE)
+mdk.HPC <- RunUMAP(mdk.HPC, dims = 1:30)
+
+# DoubletFinder - pK Identification
+sweep.res.seu <- paramSweep_V3(mdk.HPC, PCs = 1:30, sct = FALSE)
+sweep.stats_seu <- summarizeSweep(sweep.res.seu, GT = FALSE)
+bcmvn_seu <- find.pK(sweep.stats_seu)
+annotations <- mdk.HPC@meta.data$seurat_clusters
+
+# DoubletFinder - Homotypic Doublet Proportion Estimate
+homotypic.prop <- modelHomotypic(annotations)
+nExp_poi <- round(0.05*nrow(mdk.HPC@meta.data))
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+# DoubletFinder - Run DoubletFinder with varying classification stringencies
+mdk.HPC <- doubletFinder_V3(mdk.HPC, PCs = 1:30, pN = 0.25, pK = 0.09, nExp = nExp_poi, reuse.pANN = FALSE, sct = FALSE)
+mdk.HPC$Doublet_classification <- mdk.HPC@meta.data[grep("DF.classifications", colnames(mdk.HPC@meta.data))]
+mdk.HPC@meta.data[grep("DF.classifications", colnames(mdk.HPC@meta.data))] <- NULL
+mdk.HPC$Doublet_annotation <- mdk.HPC@meta.data[grep("pANN_", colnames(mdk.HPC@meta.data))]
+mdk.HPC@meta.data[grep("pANN_", colnames(mdk.HPC@meta.data))] <- NULL
+
+# Display doublet classification
+DimPlot(mdk.HPC, group.by = "Doublet_classification")
+
+# Remove doublets
+mdk.HPC <- subset(mdk.HPC, Doublet_classification == "Singlet")
+
+# Get selected cells list
+cell.use.HPC <- colnames(mdk.HPC)
+
+# Save selected cells list
+write.csv(cell.use.HPC, file = "./data_mdk/output/cell.use.HPC.csv", row.names = FALSE)
+
+# Number of HPC cells selected
+nrow(mdk.HPC@meta.data)
+```
+
+# Integrate HMC and HPC datasets and perform integrated analysis
+
+```{r integrated analysis}
+# Create a list with the two Seurat objects (HMC and HPC)
+mdk.list <- list(mdk.HMC, mdk.HPC)
+
+# Select features that are repeatedly variable across datasets for integration
+features <- SelectIntegrationFeatures(object.list = mdk.list)
+
+mdk.anchors <- FindIntegrationAnchors(object.list = mdk.list, anchor.features = features)
+
+# Create an 'integrated' data assay
+mdk.combined <- IntegrateData(anchorset = mdk.anchors)
+
+# Specify that downstream analysis will be performed on the integrated data
+DefaultAssay(mdk.combined) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+mdk.combined <- ScaleData(mdk.combined, vars.to.regress = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+mdk.combined <- RunPCA(mdk.combined, features = VariableFeatures(object = mdk.combined), npcs = 50)
+mdk.combined <- RunUMAP(mdk.combined, reduction = "pca", dims = 1:30, min.dist = 0.3, return.model = TRUE)
+mdk.combined <- RunTSNE(mdk.combined, reduction = "pca", dims = 1:30)
+mdk.combined <- FindNeighbors(mdk.combined, reduction = "pca", dims = 1:30)
+mdk.combined <- FindClusters(mdk.combined, resolution = clusters_resolution)
+```
+
+# Identify conserved cell type markers (cluster biomarkers) and annotate clusters
+
+Here, we annotate clusters as specific cell types using :
+
+* [zfin database](https://zfin.org/action/expression/search), which lists gene expression data in zebrafish.
+* Zebrafish 10hpf cluster annotation data from [Wagner et al., 2018](https://pubmed.ncbi.nlm.nih.gov/29700229/).
+
+```{r markers}
+# For performing differential expression after integration, we switch back to the original data
+DefaultAssay(mdk.combined) <- "RNA"
+
+# Find markers for every cluster compared to all remaining cells, report only the positive ones
+mdk.markers <- FindAllMarkers(mdk.combined, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# Save data frame
+data.table::fwrite(
+    mdk.markers,
+    file = paste0("./data_mdk/output/", stage, "_all_markers_cl_r_", clusters_resolution, ".xls"), sep = "\t", dec = ",", row.names = FALSE, quote = TRUE)
+
+# Find top 20 markers genes for each cluster
+top20G <- mdk.markers %>% group_by(cluster) %>% top_n(n = 20, wt = avg_log2FC)
+
+# For each cluster, plot markers on UMAP and save it
+lapply(unique(top20G$cluster), function(cl){
+  FeaturePlot(mdk.combined, features = subset(top20G, cluster==cl)$gene, label = TRUE) + plot_annotation(title = paste0("cluster", #
+cl)) + plot_layout(ncol = 4, nrow = 5)
+  ggsave(paste0("./data_mdk/output/cluster_markers_", clusters_resolution, "/", stage, "_cluster_", #cl,".pdf"), width = 20, height = 25)
+})
+
+mdk.ens <- useEnsembl(biomart = "genes", dataset = "olatipes_gene_ensembl")
+
+# Find zebrafish orthologs based on medaka gene ID (to subsequently use Zfin database)
+mdk.markers.ortho <- getBM(attributes = c("ensembl_gene_id",
+                                          "external_gene_name", 
+                                          "drerio_homolog_ensembl_gene",
+                                          "drerio_homolog_associated_gene_name",
+                                          "drerio_homolog_orthology_type",
+                                          "drerio_homolog_perc_id"),
+                             mart = mdk.ens, 
+                             filters = "ensembl_gene_id",
+                             values = unique(top20G$gene))
+
+# Merge top 20 markers genes and medaka-zebrafish orthologs data frames using medaka gene name
+mdk.markers.ortho <- full_join(top20G, mdk.markers.ortho, join_by(gene == ensembl_gene_id))
+
+# Formatting data frame
+mdk.markers.ortho <- mdk.markers.ortho %>%
+    # Use ensembl ID as gene name for medaka genes and zebrafish orthologs which do not have gene name
+    mutate(external_gene_name = if_else(external_gene_name == "", gene, external_gene_name),
+           drerio_homolog_associated_gene_name = if_else(drerio_homolog_associated_gene_name == "", drerio_homolog_ensembl_gene, drerio_homolog_associated_gene_name)) %>%
+    # Rename column
+    rename("olatipes_ensembl_gene_id" = "gene", "olatipes_gene_name" = "external_gene_name") %>%
+    # Order columns
+    dplyr::select(7,8,6,2,3,4,5,6,9,10,11,12)
+
+# Import supdata from Wagner et al., 2016, zebrafish cluster markers
+zbf_markers <- read_excel("./data_mdk/input/aar4362_tables2.xlsx")
+
+# Load zebrafish ensembl gene datasets
+zbf.ens <- useEnsembl(biomart = "genes", dataset = "drerio_gene_ensembl")
+
+# Identify markers for each cluster
+# Select zebafish 10hpf clusters (except 10hpf-EVL which does not have any marker)
+for (i in c(32:49, 51:53)){
+    
+  # Group markers of each cluster in a list
+  zbf_mdk_markers_list <- (unlist(zbf_markers[i,7:47]))
+  
+  # Associate zebrafish cluster markers with their medaka orthologs
+  zbf_mdk_markers_i <- getBM(attributes=c("ensembl_gene_id", "external_gene_name", 
+                                          "olatipes_homolog_ensembl_gene",
+                                          "olatipes_homolog_associated_gene_name",
+                                          "olatipes_homolog_orthology_type",
+                                          "olatipes_homolog_perc_id"),
+                             mart = zbf.ens,
+                             filters = "external_gene_name",
+                             values = zbf_mdk_markers_list)
+  
+  zbf_mdk_markers_i <- zbf_mdk_markers_i %>%  
+  # Add ClusterName and TissueName columns
+      mutate(ClusterName = zbf_markers[i,3],
+             TissueName = zbf_markers[i,6]) %>%
+  # Remove duplicates
+      distinct(ensembl_gene_id, .keep_all = TRUE)
+}
+
+# Merge data frames
+df_list<- mget(ls(pattern = "zbf_mdk_markers_ "))
+
+# Bind rows
+wagner.markers <- dplyr::bind_rows(df_list)
+
+# Formatting data frame
+wagner.markers <- wagner.markers %>% 
+    # Reorder
+    relocate(TissueName) %>% 
+    relocate(ClusterName) %>%
+    # Rename column
+    rename("drerio_gene_id" = "ensembl_gene_id",
+    "drerio_gene_name" = "external_gene_name") %>%
+    # Remove zebrafish genes which don't have a medaka ortholog
+    drop_na(olatipes_homolog_perc_id) %>%
+    # Remove duplicated rows based on ClusterName and olatipes_homolog_ensembl_gene
+    distinct(olatipes_homolog_ensembl_gene, ClusterName, .keep_all = TRUE)
+
+# For each of Wagner cluster, plot cell-specific markers on UMAP and save it
+lapply(unique(wagner.markers$ClusterName), function(cl){
+  FeaturePlot(mdk.combined, features = subset(wagner.markers, ClusterName == cl)$olatipes_homolog_ensembl_gene, label = TRUE) + plot_annotation(title = cl) + plot_layout(ncol = 4, nrow = 6)
+  ggsave(paste0("./data_mdk/miltenyi_cellbender/output/", stage, "/wagner_markers/", stage, "_wagner_", cl,".pdf"), width = 20, height = 30)
+})
+
+# For each cluster, find common markers (between top 20 genes and Wagner et al. 2016 list)
+common_markers <- inner_join(top20G, wagner.markers, join_by(gene ==  olatipes_homolog_ensembl_gene))
+
+# Formatting data frame
+common_markers <- common_markers %>%
+    dplyr::select(-contains("homolog")) %>%
+    dplyr::select(7,6,8,9,1,2,3,4,5,6) %>%
+    rename(olatipes_ensembl_gene_id = gene)
+
+# Save data frame
+data.table::fwrite(
+    common_markers,
+    file = paste0("./data_mdk/miltenyi_cellbender/output/", stage, "/", stage, "_common_markers_cl_r_", clusters_resolution, ".xls"), sep = "\t", dec = ",", row.names = FALSE, quote = TRUE)
+
+# For each cluster, plot markers on UMAP and save it
+lapply(unique(common_markers$ClusterName), function(cl){
+  FeaturePlot(mdk.combined, features = subset(common_markers, ClusterName == cl)$olatipes_ensembl_gene_id, label = TRUE) + #plot_annotation(title = cl) + plot_layout(ncol=4, nrow=3)
+  ggsave(paste0("./data_mdk/miltenyi_cellbender/output/", stage, "/common_markers_", clusters_resolution, "/", stage, "_common_", #cl,".pdf"), width = 20, height = 15)
+})
+```
+
+Cluster ID  | Markers                   | Cell Type
+------------|---------------------------|----------------------------------------------------------------
+0           | apoeb, lima1a             | Epidermal 1
+1           | dmbx1, en2a               | Neural mid  - midbrain 1
+2           | cdx4, sp5l                | Neural posterior 1 - tail bud, spinal cord
+3           | pcdh7, eya1               | Epidermal 2
+4           | cxcl12a, gata5            | Mesoderm - lateral plate 1/ventral mesoderm 1
+5           | traf4a, rx3               | Neural anterior - eye field
+6           | meox1, fsta               | Mesoderm - lateral plate 2/notochord/presomitic mesoderm 1
+7           | hnfb1a, prickle2b         | Neural posterior 2 - tail bud, spinal cord
+8           | meis2b, ENSLG00000029056  | Neural posterior 3 - hindbrain
+9           | dlc, ENSORLG00000006272   | Mesoderm - tail bud, presomitic mesoderm 2
+10          | lhx5, fefz2               | Neural anterior - diencephalon 1
+11          | pax2b, pax2a              | Neural mid - midbrain 2
+12          | sox10                     | Neural crest
+13          | ENSORLG00000007954, sox32 | Endoderm 1
+14          | met                       | Endoderm 2
+15          | shha, dbx1a               | Neural anterior - diencephalon 2
+16          | admp, spon1b              | Mesoderm - notochord
+17          | dlb, elavl3               | Differentiating neurons
+18          | /                         | Ribosomal proteins
+19          | fli1, esama               | Mesoderm - lateral plate 3/ventral mesoderm 2
+20          | npl, pth2ra               | Yolk syncytial layer
+21          | evpla                     | Epidermal - periderm
+
+
+```{r annotated umap, fig.height = 8}
+# Use celltype identity as droplet idents
+mdk.combined <- RenameIdents(mdk.combined, "0" = "Epidermal 1", "1" = "Midbrain 1", "2" = "Spinal cord 1", "3" = "Epidermal 2", "4" = "Ventral mesoderm 1", "5" = "Eye field", "6" = "PSM 1", "7" = "Spinal cord 2", "8" = "Hindbrain", "9" = "PSM 2", "10" = "Diencephalon 1", "11" = "Midbrain 2", "12" = "Neural crest", "13" = "Endoderm 1", "14" = "Endoderm 2", "15" = "Diencephalon 2", "16" = "Notochord", "17" = "Differentiating neurons", "18" = "unknown", "19" = "Ventral mesoderm 2", "20" = "YSL", "21" = "Periderm")
+
+# Display annotated UMAP
+DimPlot(mdk.combined, reduction = "umap", pt.size = 0.01, label = TRUE, label.size = 8, repel = TRUE) + NoLegend()
+```
+
+# Identify cell type specific differential expressed genes across genotypes
+
+```{r de.genes}
+# Set celltype x genotype info as droplets idents
+mdk.combined$celltype <- as.factor(Idents(mdk.combined))
+mdk.combined$celltype.genotype <- paste(Idents(mdk.combined), mdk.combined$genotype, sep = "_")
+Idents(mdk.combined) <- "celltype.genotype"
+
+# For performing differential expression after integration, we switch back to the original data
+DefaultAssay(mdk.combined) <- "RNA"
+
+# Find differential expressed genes per celltype across genotype
+diff.geno.markers.ct <- setDF(rbindlist(lapply(unique(mdk.combined$celltype), function(ct){
+    diff.geno.ct <- FindMarkers(mdk.combined, ident.1 = paste0(ct, "_", stage, "HMC"), ident.2 = paste0(ct, "_", stage, "HPC"), logfc.threshold = 0.25, verbose = FALSE)
+    diff.geno.ct[["celltype"]] <- paste0(ct)
+    diff.geno.ct[["gene"]] <- rownames(diff.geno.ct)
+    diff.geno.ct
+})))
+
+# Load medaka ensembl gene datasets
+mdk.ens <- useEnsembl(biomart="genes", dataset = "olatipes_gene_ensembl")
+
+# Find the human orthologs
+diff.geno.markers.ct.ortho <- getBM(attributes = c("ensembl_gene_id",
+                                                   "external_gene_name",
+                                                   "description",
+                                                   "drerio_homolog_ensembl_gene",
+                                                   "drerio_homolog_associated_gene_name",
+                                                   "drerio_homolog_orthology_type",
+                                                   "drerio_homolog_perc_id"),
+                                    mart = mdk.ens,
+                                    filters = "ensembl_gene_id",
+                                    values = unique(diff.geno.markers.ct$gene))
+
+# Merge differential expressed genes per celltype across genotype and medaka-zebrafish orthologs data frames using medaka gene name
+diff.geno.markers.ct.ortho <- full_join(diff.geno.markers.ct, diff.geno.markers.ct.ortho, join_by(gene == ensembl_gene_id))
+
+# Formatting data frames
+diff.geno.markers.ct.ortho <- diff.geno.markers.ct.ortho %>%
+    # Use ensembl ID as gene name for medaka and zebrafish genes which do not have gene name
+    mutate(external_gene_name = if_else(external_gene_name == "", gene, external_gene_name), 
+           drerio_homolog_associated_gene_name = if_else(drerio_homolog_associated_gene_name == "", drerio_homolog_ensembl_gene, drerio_homolog_associated_gene_name)) %>%
+    # Rename column
+    dplyr::rename("olatipes_ensembl_gene_id" = "gene", "olatipes_gene_name" = "external_gene_name") %>%
+    # Relocate gene id column in first
+    relocate("olatipes_ensembl_gene_id") %>% 
+    # Relocate celltype column in first
+    relocate("celltype")
+
+# Save differential expressed genes per celltype across genotype 
+data.table::fwrite(
+     filter(diff.geno.markers.ct.ortho, p_val_adj < 0.05),
+     file = paste0("./data_mdk/miltenyi_cellbender/output/", stage , "/", stage , "_DEG_cell_genotype_cl_r_", clusters_resolution, ".xls"), sep = "\t", dec = ",", row.names = FALSE, quote = TRUE)
+```
