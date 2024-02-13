@@ -83,7 +83,6 @@ Here, we import datasets processed through cellranger and cellbender, setup seur
 # Create variables that will be used in the analysis
 stage <- "s18"
 introns <- "incl"
-zbf_mk <- "10hpf"
 nFeature <- 500
 nCount <- 1000
 percent.mito <- 5
